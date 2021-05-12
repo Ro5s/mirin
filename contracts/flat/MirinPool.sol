@@ -780,7 +780,7 @@ contract MirinGovernance is MirinERC20 {
     uint8 public constant MIN_SWAP_FEE = 1;
     uint8 public constant MAX_SWAP_FEE = 100;
 
-    address public immutable factory;
+    address public factory;
 
     /**
      * @dev If empty, this is a public pool.
@@ -823,15 +823,11 @@ contract MirinGovernance is MirinERC20 {
         if (whitelistOn) require(whitelisted[account], "MIRIN: NOT_WHITELISTED");
         _;
     }
-
-    constructor(
-        address _operator,
-        uint8 _fee,
-        address _feeTo
-    ) {
+    
+    function initialize(address _operator, uint8 _fee, address _feeTo) internal {
         factory = msg.sender;
         operator = _operator;
-
+        
         if (_operator == address(0)) {
             _updateSwapFee(3);
         } else {
@@ -858,10 +854,6 @@ contract MirinGovernance is MirinERC20 {
         swapFeeTo = newFeeTo;
 
         emit SwapFeeToUpdated(newFeeTo);
-    }
-
-    function disable(address to) external onlyOperator {
-        IMirinFactory(factory).disablePool(to);
     }
 
     function setWhitelistOn(bool on) external onlyOperator {
@@ -921,10 +913,62 @@ interface IMirinCurve {
     ) external view returns (uint256);
 }
 
+interface IBentoBoxV1 {
+    function balanceOf(IERC20, address) external view returns (uint256);
+
+    function transfer(
+        IERC20 token,
+        address from,
+        address to,
+        uint256 share
+    ) external;
+
+    function transferMultiple(
+        IERC20 token,
+        address from,
+        address[] calldata tos,
+        uint256[] calldata shares
+    ) external;
+}
+
+/// @notice Interface for low-level Boshi `swap()` call.
+interface IMirinCallee {
+    function mirinCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external;
+}
+
 /**
  * @author LevX
  */
 contract MirinPool is MirinGovernance {
+    /**
+     * @dev Immutable variables for `masterContract` and all pool clones
+     */
+    IBentoBoxV1 private immutable bentoBox;
+    MirinPool private immutable masterContract;
+    address private immutable SUSHI;
+    
+    /**
+     * @notice `masterContract` variables
+     */
+    address public feeTo;
+    address public owner;
+    uint256 public SUSHI_DEPOSIT;
+    
+    mapping(address => bool) public isCurveWhitelisted;
+    mapping(address => mapping(address => address[])) public getPublicPool;
+    mapping(address => mapping(address => address[])) public getFranchisedPool;
+    mapping(address => bool) public isPool;
+    address[] public allPools;
+
+    event PoolCreated(
+        address indexed token0,
+        address indexed token1,
+        bool isPublic,
+        uint256 length,
+        address indexed pool,
+        address operator
+    );
+    event PoolDisabled(address indexed pool);
     event Mint(address indexed sender, uint256 amount0, uint256 amount1, address indexed to);
     event Burn(address indexed sender, uint256 amount0, uint256 amount1, address indexed to);
     event Swap(
@@ -940,9 +984,9 @@ contract MirinPool is MirinGovernance {
     uint256 public constant MINIMUM_LIQUIDITY = 10**3;
     bytes4 private constant SELECTOR = bytes4(keccak256(bytes("transfer(address,uint256)")));
 
-    address public immutable token0;
-    address public immutable token1;
-    address public immutable curve;
+    address public token0;
+    address public token1;
+    address public curve;
 
     bytes32 public curveData;
     uint256 public price0CumulativeLast;
@@ -962,45 +1006,92 @@ contract MirinPool is MirinGovernance {
     }
 
     modifier enabled() {
-        require(IMirinFactory(factory).isPool(address(this)), "MIRIN: DISABLED_POOL");
+        require(masterContract.isPool(address(this)), "MIRIN: DISABLED_POOL");
+        _;
+    }
+    
+    modifier onlyOwner {
+        require(msg.sender == masterContract.owner(), "MIRIN: FORBIDDEN");
         _;
     }
 
+    /**
+     * @notice The constructor is only used for the initial `masterContract`. Subsequent clones are initialized via `init()`
+     */
     constructor(
-        address _token0,
-        address _token1,
-        address _curve,
-        bytes32 _curveData,
-        address _operator,
-        uint8 _swapFee,
-        address _swapFeeTo
-    ) MirinGovernance(_operator, _swapFee, _swapFeeTo) {
+        IBentoBoxV1 _bentoBox,
+        address _SUSHI,
+        uint256 _SUSHI_DEPOSIT,
+        address _feeTo,
+        address _owner
+    ) {
+        bentoBox = _bentoBox;
+        masterContract = this;
+        SUSHI = _SUSHI;
+        SUSHI_DEPOSIT = _SUSHI_DEPOSIT;
+        feeTo = _feeTo;
+        owner = _owner;
+    }
+    
+    /**
+     * @notice Serves as the constructor for clones, as clones can't have a regular constructor
+     * @dev `data` is abi-encoded in the format: (address tokenA, address tokenB, address _curve, bytes32 _curveData, address _operator, uint8 _swapFee, address _swapFeeTo)
+     */
+    function init(bytes calldata data) external {
+        require(address(token0) == address(0), 'MIRIN: ALREADY_INITIALIZED');
+        (address tokenA, address tokenB, address _curve, bytes32 _curveData, address _operator, uint8 _swapFee, address _swapFeeTo) = abi.decode(data, (address, address, address, bytes32, address, uint8, address));
+        require(tokenA != tokenB, 'MIRIN: IDENTICAL_ADDRESSES');
+        (address _token0, address _token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+        require(_token0 != address(0), 'MIRIN: ZERO_ADDRESS');
+        require(masterContract.isCurveWhitelisted(_curve), "MIRIN: INVALID_CURVE");
         require(IMirinCurve(_curve).isValidData(_curveData), "MIRIN: INVALID_CURVE_DATA");
+        bool isPublic = operator == address(0);
+        uint256 length;
+        if (isPublic) {
+            masterContract.pushPublicPool(_token0, _token1, address(this));
+            length = masterContract.publicPoolsLength(_token0, _token1) - 1;
+        } else {
+            masterContract.pushFranchisedPool(_token0, _token1, address(this));
+            length = masterContract.franchisedPoolsLength(_token0, _token1) - 1;
+        }
+        masterContract.isPool(address(this)) == true;
+        masterContract.pushPool(address(this));
+        if (!isPublic) {
+            IERC20(SUSHI).transferFrom(msg.sender, address(this), masterContract.SUSHI_DEPOSIT());
+        }
         token0 = _token0;
         token1 = _token1;
         curve = _curve;
         curveData = _curveData;
+        MirinGovernance.initialize(_operator, _swapFee, _swapFeeTo);
+        emit PoolCreated(_token0, _token1, isPublic, length, address(this), operator);
+    }
+    
+    function pushPool(address pool) external {
+        allPools.push(pool);
+    } 
+    
+    function pushPublicPool(address tokenA, address tokenB, address pool) external {
+        getPublicPool[tokenA][tokenB].push(pool);
+        getPublicPool[tokenB][tokenA].push(pool);
+    } 
+    
+    function pushFranchisedPool(address tokenA, address tokenB, address pool) external {
+        getFranchisedPool[tokenA][tokenB].push(pool);
+        getFranchisedPool[tokenB][tokenA].push(pool);
+    } 
+    
+    /// **** GETTER FUNCTIONS ****
+    function publicPoolsLength(address tokenA, address tokenB) external view returns (uint256) {
+        return getPublicPool[tokenA][tokenB].length;
     }
 
-    function initialize(address, address) external pure {
-        revert("MIRIN: NOT_IMPLEMENTED");
+    function franchisedPoolsLength(address tokenA, address tokenB) external view returns (uint256) {
+        return getFranchisedPool[tokenA][tokenB].length;
     }
 
-    function updateCurveData(bytes32 data) external onlyOperator {
-        require(IMirinCurve(curve).canUpdateData(curveData, data), "MIRIN: CANNOT_UPDATE_DATA");
-        curveData = data;
-    }
-
-    function updateSwapFee(uint8 newFee) public onlyOperator {
-        (uint112 _reserve0, uint112 _reserve1, ) = getReserves();
-        _mintFee(_reserve0, _reserve1);
-        _updateSwapFee(newFee);
-    }
-
-    function updateSwapFeeTo(address newFeeTo) public onlyOperator {
-        (uint112 _reserve0, uint112 _reserve1, ) = getReserves();
-        _mintFee(_reserve0, _reserve1);
-        _updateSwapFeeTo(newFeeTo);
+    function allPoolsLength() external view returns (uint256) {
+        return allPools.length;
     }
 
     function getReserves()
@@ -1016,7 +1107,8 @@ contract MirinPool is MirinGovernance {
         _reserve1 = reserve1;
         _blockTimestampLast = blockTimestampLast;
     }
-
+    
+    /// **** POOL FUNCTIONS ****
     function _update(
         uint256 balance0,
         uint256 balance1,
@@ -1043,15 +1135,6 @@ contract MirinPool is MirinGovernance {
         emit Sync(uint112(balance0), uint112(balance1));
     }
 
-    function _safeTransfer(
-        address token,
-        address to,
-        uint256 value
-    ) private {
-        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(SELECTOR, to, value));
-        require(success && (data.length == 0 || abi.decode(data, (bool))), "MIRIN: TRANSFER_FAILED");
-    }
-
     function _mintFee(uint112 _reserve0, uint112 _reserve1) private {
         uint256 _kLast = kLast;
         if (_kLast != 0) {
@@ -1075,8 +1158,8 @@ contract MirinPool is MirinGovernance {
 
     function mint(address to) external lock enabled onlyWhitelisted(to) returns (uint256 liquidity) {
         (uint112 _reserve0, uint112 _reserve1, ) = getReserves();
-        uint256 balance0 = IERC20(token0).balanceOf(address(this));
-        uint256 balance1 = IERC20(token1).balanceOf(address(this));
+        uint256 balance0 = bentoBox.balanceOf(IERC20(token0), address(this));
+        uint256 balance1 = bentoBox.balanceOf(IERC20(token1), address(this));
         uint256 amount0 = balance0 - _reserve0;
         uint256 amount1 = balance1 - _reserve1;
 
@@ -1100,8 +1183,7 @@ contract MirinPool is MirinGovernance {
 
     function burn(address to) external lock onlyWhitelisted(to) returns (uint256 amount0, uint256 amount1) {
         uint256 liquidity = balanceOf[address(this)];
-        uint256 balance0 = IERC20(token0).balanceOf(address(this));
-        uint256 balance1 = IERC20(token1).balanceOf(address(this));
+        (uint256 balance0, uint256 balance1) = bentoBalance(IERC20(token0), IERC20(token1));
         uint256 _totalSupply = totalSupply;
         amount0 = (liquidity * balance0) / _totalSupply;
         amount1 = (liquidity * balance1) / _totalSupply;
@@ -1126,6 +1208,9 @@ contract MirinPool is MirinGovernance {
 
         (uint112 _reserve0, uint112 _reserve1, ) = getReserves();
         _mintFee(_reserve0, _reserve1);
+        
+        IERC20 _token0 = IERC20(token0);                                 // gas savings
+        IERC20 _token1 = IERC20(token1);                                 // gas savings
 
         uint256 computed =
             IMirinCurve(curve).computeLiquidity(uint112(_reserve0 - amount0), uint112(_reserve1 - amount1), curveData);
@@ -1137,168 +1222,104 @@ contract MirinPool is MirinGovernance {
         }
         _burn(address(this), liquidity);
 
-        _safeTransfer(token0, to, amount0);
-        _safeTransfer(token1, to, amount1);
-        uint256 balance0 = IERC20(token0).balanceOf(address(this));
-        uint256 balance1 = IERC20(token1).balanceOf(address(this));
+        bentoBox.transfer(_token0, address(this), to, amount0);
+        bentoBox.transfer(_token1, address(this), to, amount1);
+        (uint256 balance0, uint256 balance1) = bentoBalance(IERC20(_token0), IERC20(_token0));
 
         _update(balance0, balance1, _reserve0, _reserve1);
         kLast = computed;
         emit Burn(msg.sender, amount0, amount1, to);
     }
-
-    function swap(
-        uint256 amount0Out,
-        uint256 amount1Out,
-        address to,
-        bytes calldata
-    ) external {
-        swap(amount0Out, amount1Out, to);
+    
+    function bentoBalance(IERC20 _token0, IERC20 _token1) private view returns (uint256 balance0, uint256 balance1) {
+        balance0 = bentoBox.balanceOf(IERC20(_token0), address(this));
+        balance1 = bentoBox.balanceOf(IERC20(_token1), address(this));
+    }
+    
+    function computeCheck(uint256 amount0In, uint256 amount1In, uint256 balance0, uint256 balance1, uint112 _reserve0, uint112 _reserve1) private view {
+        require(amount0In > 0 || amount1In > 0, "MIRIN: INSUFFICIENT_INPUT_AMOUNT");
+        uint256 balance0Adjusted = balance0 * 1000 - amount0In * swapFee;
+        uint256 balance1Adjusted = balance1 * 1000 - amount1In * swapFee;
+        bytes32 _curveData = curveData;
+        require(
+            IMirinCurve(curve).computeLiquidity(uint112(balance0Adjusted), uint112(balance1Adjusted), _curveData) >=
+            IMirinCurve(curve).computeLiquidity(_reserve0 * 1000, _reserve1 * 1000, _curveData),
+            "MIRIN: LIQUIDITY"
+        );
+    }
+    
+    function _swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data, address _token0, address _token1) private {
+        if (amount0Out > 0) bentoBox.transfer(IERC20(_token0), address(this), to, amount0Out); // optimistically transfer tokens
+        if (amount1Out > 0) bentoBox.transfer(IERC20(_token1), address(this), to, amount1Out); // optimistically transfer tokens
+        if (data.length > 0) IMirinCallee(to).mirinCall(msg.sender, amount0Out, amount1Out, data);
     }
 
-    function swap(
-        uint256 amount0Out,
-        uint256 amount1Out,
-        address to
-    ) public lock enabled onlyWhitelisted(to) {
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external lock enabled {
+        (uint112 _reserve0, uint112 _reserve1, ) = getReserves(); // gas savings
+        { // scope for _token{0,1} avoids stack too deep errors
+        address _token0 = token0;
+        address _token1 = token1;
         require(amount0Out > 0 || amount1Out > 0, "MIRIN: INSUFFICIENT_OUTPUT_AMOUNT");
-        (uint112 _reserve0, uint112 _reserve1, ) = getReserves();
         require(amount0Out < _reserve0 && amount1Out < _reserve1, "MIRIN: INSUFFICIENT_LIQUIDITY");
-
-        require(to != token0 && to != token1, "MIRIN: INVALID_TO");
-        if (amount0Out > 0) _safeTransfer(token0, to, amount0Out);
-        if (amount1Out > 0) _safeTransfer(token1, to, amount1Out);
-        uint256 balance0 = IERC20(token0).balanceOf(address(this));
-        uint256 balance1 = IERC20(token1).balanceOf(address(this));
+        require(to != _token0 && to != _token1, "MIRIN: INVALID_TO");
+        _swap(amount0Out, amount1Out, to, data, _token0, _token1);
+        }
+        (uint256 balance0, uint256 balance1) = bentoBalance(IERC20(token0), IERC20(token1));
         uint256 amount0In = balance0 > _reserve0 - amount0Out ? balance0 - (_reserve0 - amount0Out) : 0;
         uint256 amount1In = balance1 > _reserve1 - amount1Out ? balance1 - (_reserve1 - amount1Out) : 0;
-        require(amount0In > 0 || amount1In > 0, "MIRIN: INSUFFICIENT_INPUT_AMOUNT");
-        {
-            uint256 balance0Adjusted = balance0 * 1000 - amount0In * swapFee;
-            uint256 balance1Adjusted = balance1 * 1000 - amount1In * swapFee;
-            bytes32 _curveData = curveData;
-            require(
-                IMirinCurve(curve).computeLiquidity(uint112(balance0Adjusted), uint112(balance1Adjusted), _curveData) >=
-                    IMirinCurve(curve).computeLiquidity(_reserve0 * 1000, _reserve1 * 1000, _curveData),
-                "MIRIN: LIQUIDITY"
-            );
-        }
-
+        computeCheck(amount0In, amount1In, balance0, balance1, _reserve0, _reserve1);
+        
         _update(balance0, balance1, _reserve0, _reserve1);
+
         emit Swap(msg.sender, amount0In, amount1In, amount0Out, amount1Out, to);
     }
 
-    function skim(address to) external lock {
-        _safeTransfer(token0, to, IERC20(token0).balanceOf(address(this)) - reserve0);
-        _safeTransfer(token1, to, IERC20(token1).balanceOf(address(this)) - reserve1);
-    }
-
     function sync() external lock {
-        _update(IERC20(token0).balanceOf(address(this)), IERC20(token1).balanceOf(address(this)), reserve0, reserve1);
+        (uint256 balance0, uint256 balance1) = bentoBalance(IERC20(token0), IERC20(token1));
+        _update(balance0, balance1, reserve0, reserve1);
     }
-}
+    
+    /// **** POOL OPERATOR ****
+    function disablePool(address to) external onlyOperator {
+        require(masterContract.isPool(address(this)), "MIRIN: ALREADY_DISABLED");
+        masterContract.isPool(address(this)) == false;
 
-contract MirinFactory {
-    uint256 public constant SUSHI_DEPOSIT = 10000 * 1e18;
+        IERC20(SUSHI).transfer(to, IERC20(SUSHI).balanceOf(address(this)));
 
-    address public immutable SUSHI;
-    address public feeTo;
-    address public owner;
-
-    mapping(address => bool) public isCurveWhitelisted;
-    mapping(address => mapping(address => address[])) public getPublicPool;
-    mapping(address => mapping(address => address[])) public getFranchisedPool;
-    mapping(address => bool) public isPool;
-    address[] public allPools;
-
-    event PoolCreated(
-        address indexed token0,
-        address indexed token1,
-        bool isPublic,
-        uint256 length,
-        address indexed pool,
-        address operator
-    );
-    event PoolDisabled(address indexed pool);
-
-    modifier onlyOwner {
-        require(msg.sender == owner, "MIRIN: FORBIDDEN");
-        _;
+        emit PoolDisabled(address(this));
     }
 
-    constructor(
-        address _sushi,
-        address _feeTo,
-        address _owner
-    ) {
-        SUSHI = _sushi;
-        feeTo = _feeTo;
-        owner = _owner;
+    function updateCurveData(bytes32 data) external onlyOperator {
+        require(IMirinCurve(curve).canUpdateData(curveData, data), "MIRIN: CANNOT_UPDATE_DATA");
+        curveData = data;
     }
 
-    function publicPoolsLength(address token0, address token1) external view returns (uint256) {
-        return getPublicPool[token0][token1].length;
+    function updateSwapFee(uint8 newFee) public onlyOperator {
+        (uint112 _reserve0, uint112 _reserve1, ) = getReserves();
+        _mintFee(_reserve0, _reserve1);
+        _updateSwapFee(newFee);
     }
 
-    function franchisedPoolsLength(address token0, address token1) external view returns (uint256) {
-        return getFranchisedPool[token0][token1].length;
+    function updateSwapFeeTo(address newFeeTo) public onlyOperator {
+        (uint112 _reserve0, uint112 _reserve1, ) = getReserves();
+        _mintFee(_reserve0, _reserve1);
+        _updateSwapFeeTo(newFeeTo);
     }
-
-    function allPoolsLength() external view returns (uint256) {
-        return allPools.length;
+    
+    /// **** MASTER GOVERNANCE **** 
+    function setDeposit(uint256 _SUSHI_DEPOSIT) external onlyOwner {
+        SUSHI_DEPOSIT = _SUSHI_DEPOSIT;
     }
-
-    function whitelistCurve(address curve) external onlyOwner {
-        isCurveWhitelisted[curve] = true;
-    }
-
-    function createPool(
-        address tokenA,
-        address tokenB,
-        address curve,
-        bytes32 curveData,
-        address operator,
-        uint8 swapFee,
-        address swapFeeTo
-    ) external returns (MirinPool pool) {
-        require(tokenA != tokenB, "MIRIN: IDENTICAL_ADDRESSES");
-        (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
-        require(token0 != address(0), "MIRIN: ZERO_ADDRESS");
-        require(isCurveWhitelisted[curve], "MIRIN: INVALID_CURVE");
-        pool = new MirinPool(token0, token1, curve, curveData, operator, swapFee, swapFeeTo);
-        bool isPublic = operator == address(0);
-        uint256 length;
-        if (isPublic) {
-            length = getPublicPool[token0][token1].length;
-            getPublicPool[token0][token1].push(address(pool));
-            getPublicPool[token1][token0].push(address(pool));
-        } else {
-            length = getFranchisedPool[token0][token1].length;
-            getFranchisedPool[token0][token1].push(address(pool));
-            getFranchisedPool[token1][token0].push(address(pool));
-        }
-        isPool[address(pool)] = true;
-        allPools.push(address(pool));
-        if (!isPublic) {
-            IERC20(SUSHI).transferFrom(msg.sender, address(this), SUSHI_DEPOSIT);
-        }
-        emit PoolCreated(token0, token1, isPublic, length, address(pool), operator);
-    }
-
-    function disablePool(address to) external {
-        require(isPool[msg.sender], "MIRIN: ALREADY_DISABLED");
-        isPool[msg.sender] = false;
-
-        IERC20(SUSHI).transfer(to, SUSHI_DEPOSIT);
-
-        emit PoolDisabled(msg.sender);
-    }
-
+    
     function setFeeTo(address _feeTo) external onlyOwner {
         feeTo = _feeTo;
     }
 
     function setOwner(address _owner) external onlyOwner {
         owner = _owner;
+    }
+    
+    function whitelistCurve(address _curve) external onlyOwner {
+        isCurveWhitelisted[_curve] = true;
     }
 }
